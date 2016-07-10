@@ -1,0 +1,349 @@
+From da6694ea7aff91a1f6677707255c9df6dcecf448 Mon Sep 17 00:00:00 2001
+From: Bo Gan <bg2539@bug01.cs.columbia.edu>
+Date: Fri, 29 Jan 2016 18:44:49 -0500
+Subject: [PATCH 1/3] update for new __tsan_writeN interface
+
+---
+ lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 1a46bbb..9432a29 100644
+--- a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -150,7 +150,7 @@ void ThreadSanitizer::initializeCallbacks(Module &M) {
+ 
+     SmallString<32> WriteName("__tsan_write" + itostr(ByteSize));
+     TsanWrite[i] = checkSanitizerInterfaceFunction(M.getOrInsertFunction(
+-        WriteName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
++        WriteName, IRB.getVoidTy(), IRB.getInt8PtrTy(), IRB.getInt64Ty(), nullptr));
+ 
+     SmallString<64> UnalignedReadName("__tsan_unaligned_read" +
+         itostr(ByteSize));
+@@ -162,7 +162,7 @@ void ThreadSanitizer::initializeCallbacks(Module &M) {
+         itostr(ByteSize));
+     TsanUnalignedWrite[i] =
+         checkSanitizerInterfaceFunction(M.getOrInsertFunction(
+-            UnalignedWriteName, IRB.getVoidTy(), IRB.getInt8PtrTy(), nullptr));
++            UnalignedWriteName, IRB.getVoidTy(), IRB.getInt8PtrTy(), IRB.getInt64Ty(), nullptr));
+ 
+     Type *Ty = Type::getIntNTy(M.getContext(), BitSize);
+     Type *PtrTy = Ty->getPointerTo();
+@@ -412,6 +412,9 @@ bool ThreadSanitizer::instrumentLoadOrStore(Instruction *I,
+   Value *Addr = IsWrite
+       ? cast<StoreInst>(I)->getPointerOperand()
+       : cast<LoadInst>(I)->getPointerOperand();
++  Value *Val = IsWrite
++      ? cast<StoreInst>(I)->getValueOperand()
++      : nullptr;
+   int Idx = getMemoryAccessFuncIndex(Addr, DL);
+   if (Idx < 0)
+     return false;
+@@ -449,7 +452,10 @@ bool ThreadSanitizer::instrumentLoadOrStore(Instruction *I,
+     OnAccessFunc = IsWrite ? TsanWrite[Idx] : TsanRead[Idx];
+   else
+     OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
+-  IRB.CreateCall(OnAccessFunc, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
++  if(IsWrite)
++    IRB.CreateCall(OnAccessFunc, { IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()), IRB.CreateZExtOrBitCast(Val, IRB.getInt64Ty()) } );
++  else
++    IRB.CreateCall(OnAccessFunc, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
+   if (IsWrite) NumInstrumentedWrites++;
+   else         NumInstrumentedReads++;
+   return true;
+-- 
+1.9.1
+
+
+From 565665f2d359d33ea199300da4a553e8a8f40ee0 Mon Sep 17 00:00:00 2001
+From: Bo Gan <bg2539@bug01.cs.columbia.edu>
+Date: Sat, 6 Feb 2016 00:23:25 -0500
+Subject: [PATCH 2/3] implement adhoc var hack
+
+---
+ lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 102 ++++++++++++++++++++-
+ 1 file changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 9432a29..4fd0d64 100644
+--- a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -36,17 +36,109 @@
+ #include "llvm/IR/Metadata.h"
+ #include "llvm/IR/Module.h"
+ #include "llvm/IR/Type.h"
++#include "llvm/IR/DebugInfoMetadata.h"
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/Debug.h"
+ #include "llvm/Support/MathExtras.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/Support/Process.h"
++#include "llvm/Support/Regex.h"
++#include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+ #include "llvm/Transforms/Utils/ModuleUtils.h"
+ 
++#include <fstream>
++#include <list>
++
+ using namespace llvm;
+ 
+ #define DEBUG_TYPE "tsan"
+ 
++struct AdhocSyncVars{
++  using VarLoc = std::pair<StringRef, unsigned>;
++  using VarSet = std::set<VarLoc>;
++  std::list<std::string> lines;
++  VarSet WriteIns;
++  VarSet ReadIns;
++  static inline void PrintVarSet(const VarSet& s){
++    for(auto& e : s){
++      dbgs() << e.first << ":" << e.second << "\n";
++    }
++  }
++  inline void Print() const {
++    dbgs() << "tsan: adhoc reads\n";
++    PrintVarSet(ReadIns);
++    dbgs() << "tsan: adhoc writes\n";
++    PrintVarSet(WriteIns);
++  }
++  static inline bool isTargetInst(Instruction* Inst,
++                                  const VarSet::value_type*& Loc,
++                                  const VarSet& s){
++    if(DILocation* Loc = Inst->getDebugLoc()) {
++      auto Line = Loc->getLine();
++      auto File = Loc->getFilename();
++      return s.find(std::make_pair(File, Line)) != s.end();
++    }
++    return false;
++  }
++  template<typename T>
++  static inline void setAtomic(T* Inst, const VarSet::value_type& Loc){
++    dbgs() << "instruction [";
++    Inst->print(dbgs());
++    dbgs() << "] at " << Loc.first << ":" << Loc.second;
++    if(Inst->getOrdering() != Unordered){
++      dbgs() << "is already atomic\n";
++    }
++    else{
++      dbgs() << "will be promoted to seq_cst\n";
++    }
++    Inst->setAtomic(SequentiallyConsistent);
++  }
++  inline bool checkSetAtomicRead(Instruction* Inst) const{
++    const VarSet::value_type* Loc = nullptr;
++    if(isTargetInst(Inst, Loc, ReadIns)){
++      setAtomic(cast<LoadInst>(Inst), *Loc);
++      return true;
++    }
++    return false;
++  }
++  inline bool checkSetAtomicWrite(Instruction* Inst) const{
++    const VarSet::value_type* Loc = nullptr;
++    if(isTargetInst(Inst, Loc, WriteIns)){
++      setAtomic(cast<StoreInst>(Inst), *Loc);
++      return true;
++    }
++    return false;
++  }
++};
++
++AdhocSyncVars InitSyncVars(void){
++  AdhocSyncVars ret;
++  Regex regex("\\((.+):([0-9]+)\\) \\((.+):([0-9]+)\\)");
++  auto var_list = sys::Process::GetEnv("TSAN_ADHOC_LIST");
++  if(var_list){
++    dbgs() << "tsan: using " << var_list.getValue() << " as adhoc var list\n";
++    std::ifstream ifs(var_list.getValue());
++    std::string line;
++    while(getline(ifs, line)){
++      ret.lines.push_back(std::move(line));
++      SmallVector<StringRef, 5> vec;
++      if(!regex.match(ret.lines.back(), &vec)) {
++        report_fatal_error("adhoc var list invalid format\n");
++      }
++      ret.WriteIns.insert(std::make_pair(vec[1],
++        strtoul(vec[2].data(), nullptr, 0)));
++      ret.ReadIns.insert(std::make_pair(vec[3],
++        strtoul(vec[4].data(), nullptr, 0)));
++    }
++    ret.Print();
++  }
++  return ret;
++}
++
++//relies on RVO
++static AdhocSyncVars SyncVars = InitSyncVars();
++
+ static cl::opt<bool>  ClInstrumentMemoryAccesses(
+     "tsan-instrument-memory-accesses", cl::init(true),
+     cl::desc("Instrument memory accesses"), cl::Hidden);
+@@ -350,10 +442,16 @@ bool ThreadSanitizer::runOnFunction(Function &F) {
+   // Traverse all instructions, collect loads/stores/returns, check for calls.
+   for (auto &BB : F) {
+     for (auto &Inst : BB) {
++      if (isa<LoadInst>(Inst) && !SyncVars.checkSetAtomicRead(&Inst)){
++        LocalLoadsAndStores.push_back(&Inst);
++        continue;
++      }
++      else if(isa<StoreInst>(Inst) && !SyncVars.checkSetAtomicWrite(&Inst)){
++        LocalLoadsAndStores.push_back(&Inst);
++        continue;
++      }
+       if (isAtomic(&Inst))
+         AtomicAccesses.push_back(&Inst);
+-      else if (isa<LoadInst>(Inst) || isa<StoreInst>(Inst))
+-        LocalLoadsAndStores.push_back(&Inst);
+       else if (isa<ReturnInst>(Inst))
+         RetVec.push_back(&Inst);
+       else if (isa<CallInst>(Inst) || isa<InvokeInst>(Inst)) {
+-- 
+1.9.1
+
+
+From 13806bd370e6dbe1bde67262904bf072a3b6c701 Mon Sep 17 00:00:00 2001
+From: Bo Gan <bg2539@bug01.cs.columbia.edu>
+Date: Sat, 6 Feb 2016 05:13:40 -0500
+Subject: [PATCH 3/3] bug fix
+
+---
+ lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 73 +++++++++++++++-------
+ 1 file changed, 50 insertions(+), 23 deletions(-)
+
+diff --git a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 4fd0d64..b536385 100644
+--- a/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -72,43 +72,51 @@ struct AdhocSyncVars{
+     PrintVarSet(WriteIns);
+   }
+   static inline bool isTargetInst(Instruction* Inst,
+-                                  const VarSet::value_type*& Loc,
++                                  const VarSet::value_type*& Lineno,
+                                   const VarSet& s){
+     if(DILocation* Loc = Inst->getDebugLoc()) {
+       auto Line = Loc->getLine();
+       auto File = Loc->getFilename();
+-      return s.find(std::make_pair(File, Line)) != s.end();
++      auto pos = File.rfind('/');
++      if(pos != StringRef::npos){
++        File = File.substr(pos + 1);
++      }
++      auto i = s.find(std::make_pair(File, Line));
++      if(i != s.end()){
++        Lineno = &*i;
++        return true;
++      }
+     }
+     return false;
+   }
+   template<typename T>
+-  static inline void setAtomic(T* Inst, const VarSet::value_type& Loc){
++  static inline void setAtomic(T* Inst, const VarSet::value_type& Lineno){
+     dbgs() << "instruction [";
+     Inst->print(dbgs());
+-    dbgs() << "] at " << Loc.first << ":" << Loc.second;
+-    if(Inst->getOrdering() != Unordered){
+-      dbgs() << "is already atomic\n";
++    dbgs() << "] at " << Lineno.first << ":" << Lineno.second;
++    if(Inst->getOrdering() > Monotonic){
++      dbgs() << " is already atomic with order " << Inst->getOrdering() << "\n";
+     }
+     else{
+-      dbgs() << "will be promoted to seq_cst\n";
++      dbgs() << " will be promoted to seq_cst\n";
++      Inst->setAtomic(SequentiallyConsistent);
+     }
+-    Inst->setAtomic(SequentiallyConsistent);
+   }
+   inline bool checkSetAtomicRead(Instruction* Inst) const{
+-    const VarSet::value_type* Loc = nullptr;
+-    if(isTargetInst(Inst, Loc, ReadIns)){
+-      setAtomic(cast<LoadInst>(Inst), *Loc);
++    const VarSet::value_type* Lineno = nullptr;
++    if(isTargetInst(Inst, Lineno, ReadIns)){
++      setAtomic(cast<LoadInst>(Inst), *Lineno);
+       return true;
+     }
+-    return false;
++    return cast<LoadInst>(Inst)->isAtomic();
+   }
+   inline bool checkSetAtomicWrite(Instruction* Inst) const{
+-    const VarSet::value_type* Loc = nullptr;
+-    if(isTargetInst(Inst, Loc, WriteIns)){
+-      setAtomic(cast<StoreInst>(Inst), *Loc);
++    const VarSet::value_type* Lineno = nullptr;
++    if(isTargetInst(Inst, Lineno, WriteIns)){
++      setAtomic(cast<StoreInst>(Inst), *Lineno);
+       return true;
+     }
+-    return false;
++    return cast<StoreInst>(Inst)->isAtomic();
+   }
+ };
+ 
+@@ -550,8 +558,18 @@ bool ThreadSanitizer::instrumentLoadOrStore(Instruction *I,
+     OnAccessFunc = IsWrite ? TsanWrite[Idx] : TsanRead[Idx];
+   else
+     OnAccessFunc = IsWrite ? TsanUnalignedWrite[Idx] : TsanUnalignedRead[Idx];
+-  if(IsWrite)
+-    IRB.CreateCall(OnAccessFunc, { IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()), IRB.CreateZExtOrBitCast(Val, IRB.getInt64Ty()) } );
++  if(IsWrite){
++    Type* ValType = Val->getType();
++    Value* CastToVal;
++    if(ValType->isPointerTy())
++      CastToVal = IRB.CreatePtrToInt(Val, IRB.getIntPtrTy(DL));
++    else
++      CastToVal = IRB.CreateZExt(
++                    IRB.CreateBitCast(Val, IRB.getIntNTy((1U << Idx) * 8)),
++                    IRB.getIntPtrTy(DL));
++    IRB.CreateCall(OnAccessFunc,
++        {IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()), CastToVal } );
++  }
+   else
+     IRB.CreateCall(OnAccessFunc, IRB.CreatePointerCast(Addr, IRB.getInt8PtrTy()));
+   if (IsWrite) NumInstrumentedWrites++;
+@@ -623,9 +641,13 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
+     Type *PtrTy = Ty->getPointerTo();
+     Value *Args[] = {IRB.CreatePointerCast(Addr, PtrTy),
+                      createOrdering(&IRB, LI->getOrdering())};
+-    CallInst *C = CallInst::Create(TsanAtomicLoad[Idx], Args);
+-    ReplaceInstWithInst(I, C);
+-
++    Value *C = IRB.CreateCall(TsanAtomicLoad[Idx], Args);
++    Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
++    if(OrigTy->isPointerTy()){
++      C = IRB.CreateIntToPtr(C, OrigTy);
++    }
++    I->replaceAllUsesWith(C);
++    I->getParent()->getInstList().erase(I);
+   } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+     Value *Addr = SI->getPointerOperand();
+     int Idx = getMemoryAccessFuncIndex(Addr, DL);
+@@ -635,8 +657,13 @@ bool ThreadSanitizer::instrumentAtomic(Instruction *I, const DataLayout &DL) {
+     const size_t BitSize = ByteSize * 8;
+     Type *Ty = Type::getIntNTy(IRB.getContext(), BitSize);
+     Type *PtrTy = Ty->getPointerTo();
++    Type *OrigTy = cast<PointerType>(Addr->getType())->getElementType();
++    Value* Val = SI->getValueOperand();
++    if(OrigTy->isPointerTy()){
++      Val = IRB.CreatePtrToInt(Val, Ty);
++    }
+     Value *Args[] = {IRB.CreatePointerCast(Addr, PtrTy),
+-                     IRB.CreateIntCast(SI->getValueOperand(), Ty, false),
++                     IRB.CreateIntCast(Val, Ty, false),
+                      createOrdering(&IRB, SI->getOrdering())};
+     CallInst *C = CallInst::Create(TsanAtomicStore[Idx], Args);
+     ReplaceInstWithInst(I, C);
+@@ -696,7 +723,7 @@ int ThreadSanitizer::getMemoryAccessFuncIndex(Value *Addr,
+   assert(OrigTy->isSized());
+   uint32_t TypeSize = DL.getTypeStoreSizeInBits(OrigTy);
+   if (TypeSize != 8  && TypeSize != 16 &&
+-      TypeSize != 32 && TypeSize != 64 && TypeSize != 128) {
++      TypeSize != 32 && TypeSize != 64 /*&& TypeSize != 128*/) {
+     NumAccessesWithBadSize++;
+     // Ignore all unusual sizes.
+     return -1;
+-- 
+1.9.1
+
